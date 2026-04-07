@@ -5,7 +5,7 @@ Ce dépôt contient un script bash interactif `node-ufw-manager.sh` qui permet d
 ## Fonctionnalités principales
 
 - Choix de l’interface réseau (priorité wg3 > wg2 > wg1 > wg0).  
-- Autorisation du port SSH (22, 922 ou ports personnalisés), depuis la plage WireGuard `44.27.27.160/27` et depuis un ou plusieurs réseaux locaux (LAN + ZeroTier).  
+- Autorisation du port SSH (22 ou ports personnalisés), depuis la plage WireGuard `44.27.27.XX/27` et depuis un ou plusieurs réseaux locaux (LAN + ZeroTier).  
 - Configuration des ports EchoLink (UDP 5198, UDP 5199, TCP 5200).  
 - Mode interactif : `mode test` (rollback automatique au reboot) et `mode statique` (appliqué de façon permanente).  
 - Support UFW ou iptables, détectés automatiquement.  
