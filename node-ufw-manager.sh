@@ -308,6 +308,8 @@ for zt_iface in $(ip link show | grep -o 'zt[a-z0-9]*'); do
     echo "+ iptables -I INPUT 4 -i $zt_iface -p icmp --icmp-type echo-request -j ACCEPT"
     iptables -I INPUT 4 -i "$zt_iface" -p icmp --icmp-type echo-request -j ACCEPT
   }
+done
+  
   iptables_enable_persistence_if_possible
 }
 
