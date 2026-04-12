@@ -272,44 +272,59 @@ setup_defaults_iptables() {
 }
 
 apply_base_rules_iptables() {
-  local p net
+  local p net zt_iface
+  local -a zt_ifaces=()
+
+  add_rule() {
+    local chain="$1"
+    shift
+    if ! iptables_rule_exists "$chain" "$@"; then
+      echo "+ iptables -A $chain $*"
+      iptables -A "$chain" "$@"
+    fi
+  }
+
+  insert_rule() {
+    local chain="$1"
+    local pos="$2"
+    shift 2
+    if ! iptables_rule_exists "$chain" "$@"; then
+      echo "+ iptables -I $chain $pos $*"
+      iptables -I "$chain" "$pos" "$@"
+    fi
+  }
+
+  # SSH depuis le range WireGuard
   for p in "${SSH_PORTS[@]}"; do
-    iptables_rule_exists INPUT -i "$SELECTED_IFACE" -p tcp -s "$WG_RANGE" --dport "$p" -j ACCEPT || {
-      echo "+ iptables -A INPUT -i $SELECTED_IFACE -p tcp -s $WG_RANGE --dport $p -j ACCEPT"
-      iptables -A INPUT -i "$SELECTED_IFACE" -p tcp -s "$WG_RANGE" --dport "$p" -j ACCEPT
-    }
+    add_rule INPUT -i "$SELECTED_IFACE" -p tcp -s "$WG_RANGE" --dport "$p" -j ACCEPT
+
+    # SSH depuis les réseaux locaux
     for net in "${LOCAL_NETS[@]}"; do
-      iptables_rule_exists INPUT -p tcp -s "$net" --dport "$p" -j ACCEPT || {
-        echo "+ iptables -A INPUT -p tcp -s $net --dport $p -j ACCEPT"
-        iptables -A INPUT -p tcp -s "$net" --dport "$p" -j ACCEPT
-      }
+      add_rule INPUT -p tcp -s "$net" --dport "$p" -j ACCEPT
     done
   done
-  iptables_rule_exists INPUT -i "$SELECTED_IFACE" -p udp --dport "${ECHO_UDP_PORTS[0]}" -j ACCEPT || {
-    echo "+ iptables -A INPUT -i $SELECTED_IFACE -p udp --dport ${ECHO_UDP_PORTS[0]} -j ACCEPT"
-    iptables -A INPUT -i "$SELECTED_IFACE" -p udp --dport "${ECHO_UDP_PORTS[0]}" -j ACCEPT
-  }
-  iptables_rule_exists INPUT -i "$SELECTED_IFACE" -p udp --dport "${ECHO_UDP_PORTS[1]}" -j ACCEPT || {
-    echo "+ iptables -A INPUT -i $SELECTED_IFACE -p udp --dport ${ECHO_UDP_PORTS[1]} -j ACCEPT"
-    iptables -A INPUT -i "$SELECTED_IFACE" -p udp --dport "${ECHO_UDP_PORTS[1]}" -j ACCEPT
-  }
-  iptables_rule_exists INPUT -i "$SELECTED_IFACE" -p tcp --dport "$ECHO_TCP_PORT" -j ACCEPT || {
-    echo "+ iptables -A INPUT -i $SELECTED_IFACE -p tcp --dport $ECHO_TCP_PORT -j ACCEPT"
-    iptables -A INPUT -i "$SELECTED_IFACE" -p tcp --dport "$ECHO_TCP_PORT" -j ACCEPT
-  }
-  # Autoriser ping (ICMP echo-request) sur wg0 et zt* (toutes sources)
-iptables_rule_exists INPUT -i "$SELECTED_IFACE" -p icmp --icmp-type echo-request -j ACCEPT || {
-  echo "+ iptables -I INPUT 3 -i $SELECTED_IFACE -p icmp --icmp-type echo-request -j ACCEPT"
-  iptables -I INPUT 3 -i "$SELECTED_IFACE" -p icmp --icmp-type echo-request -j ACCEPT
-}
-# Pour ZeroTier (zt*)
-for zt_iface in $(ip link show | grep -o 'zt[a-z0-9]*'); do
-  iptables_rule_exists INPUT -i "$zt_iface" -p icmp --icmp-type echo-request -j ACCEPT || {
-    echo "+ iptables -I INPUT 4 -i $zt_iface -p icmp --icmp-type echo-request -j ACCEPT"
-    iptables -I INPUT 4 -i "$zt_iface" -p icmp --icmp-type echo-request -j ACCEPT
-  }
-done
-  
+
+  # EchoLink / services UDP
+  for p in "${ECHO_UDP_PORTS[@]}"; do
+    add_rule INPUT -i "$SELECTED_IFACE" -p udp --dport "$p" -j ACCEPT
+  done
+
+  # EchoLink / service TCP
+  add_rule INPUT -i "$SELECTED_IFACE" -p tcp --dport "$ECHO_TCP_PORT" -j ACCEPT
+
+  # Ping sur l'interface principale sélectionnée
+  insert_rule INPUT 3 -i "$SELECTED_IFACE" -p icmp --icmp-type echo-request -j ACCEPT
+
+  # Détection propre des interfaces ZeroTier
+  while IFS= read -r zt_iface; do
+    [[ -n "$zt_iface" ]] && zt_ifaces+=("$zt_iface")
+  done < <(ip -o link show | awk -F': ' '/zt[a-zA-Z0-9]*/ {print $2}' | cut -d'@' -f1)
+
+  # Ping sur toutes les interfaces zt*
+  for zt_iface in "${zt_ifaces[@]}"; do
+    insert_rule INPUT 4 -i "$zt_iface" -p icmp --icmp-type echo-request -j ACCEPT
+  done
+
   iptables_enable_persistence_if_possible
 }
 
