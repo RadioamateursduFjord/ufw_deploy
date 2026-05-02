@@ -113,8 +113,7 @@ detect_ssh_ports() {
     done < <(grep -hE '^[[:space:]]*Port[[:space:]]+[0-9]+' "${files[@]}" 2>/dev/null || true)
   fi
   [[ ${#ports[@]} -gt 0 ]] || ports=(22)
-  mapfile -t DETECTED_SSH_PORTS < <(printf '%s
-' "${ports[@]}" | sort -n | awk '!seen[$0]++')
+  mapfile -t DETECTED_SSH_PORTS < <(printf '%s\n' "${ports[@]}" | sort -n | awk '!seen[$0]++')
 }
 
 choose_ssh_ports() {
@@ -171,8 +170,7 @@ detect_local_networks() {
   if [[ ${#nets[@]} -eq 0 ]]; then
     mapfile -t nets < <(ip -o -f inet addr show scope global | awk '{print $2" "$4}')
   fi
-  mapfile -t LOCAL_NET_CHOICES < <(printf '%s
-' "${nets[@]}" | awk '!seen[$0]++')
+  mapfile -t LOCAL_NET_CHOICES < <(printf '%s\n' "${nets[@]}" | awk '!seen[$0]++')
 }
 
 choose_local_networks() {
@@ -209,8 +207,7 @@ choose_local_networks() {
       LOCAL_NETS+=("$item")
     done
   fi
-  mapfile -t LOCAL_NETS < <(printf '%s
-' "${LOCAL_NETS[@]}" | awk '!seen[$0]++')
+  mapfile -t LOCAL_NETS < <(printf '%s\n' "${LOCAL_NETS[@]}" | awk '!seen[$0]++')
 }
 
 ufw_rule_already_present() { local needle="$1"; ufw status | grep -F -- "$needle" >/dev/null 2>&1; }
@@ -243,6 +240,30 @@ setup_defaults_ufw() {
   ufw default allow outgoing
 }
 
+# Injecte les règles ICMP filtrées dans /etc/ufw/before.rules (avant le COMMIT final)
+# Seul WG_RANGE est autorisé pour echo-request; tout le reste est bloqué.
+apply_icmp_filter_ufw() {
+  local before_rules="/etc/ufw/before.rules"
+  local marker="# node-ufw-manager: ICMP WG_RANGE filter"
+
+  if grep -q "$marker" "$before_rules" 2>/dev/null; then
+    echo "= Règles ICMP déjà présentes dans $before_rules, ignorées."
+    return
+  fi
+
+  echo "+ Injection des règles ICMP dans $before_rules"
+
+  # On insère avant la ligne COMMIT de la chaîne filter
+  sed -i "/^COMMIT$/i \\
+$marker\\
+-A ufw-before-input -p icmp --icmp-type echo-request -s $WG_RANGE -j ACCEPT\\
+-A ufw-before-input -p icmp --icmp-type echo-request -j DROP" "$before_rules"
+
+  # Supprimer les règles echo-request permissives déjà présentes dans before.rules
+  # (UFW en met une par défaut pour tout autoriser)
+  sed -i '/^-A ufw-before-input -p icmp --icmp-type echo-request -j ACCEPT$/d' "$before_rules"
+}
+
 apply_base_rules_ufw() {
   local p net
   for p in "${SSH_PORTS[@]}"; do
@@ -254,6 +275,9 @@ apply_base_rules_ufw() {
   apply_rule_safe_ufw "ufw allow in on $SELECTED_IFACE proto udp from any to any port ${ECHO_UDP_PORTS[0]} comment 'EchoLink UDP 5198'" "${ECHO_UDP_PORTS[0]}/udp"
   apply_rule_safe_ufw "ufw allow in on $SELECTED_IFACE proto udp from any to any port ${ECHO_UDP_PORTS[1]} comment 'EchoLink UDP 5199'" "${ECHO_UDP_PORTS[1]}/udp"
   apply_rule_safe_ufw "ufw allow in on $SELECTED_IFACE proto tcp from any to any port $ECHO_TCP_PORT comment 'EchoLink TCP 5200'" "$ECHO_TCP_PORT/tcp"
+
+  # Filtre ICMP : seul WG_RANGE autorisé
+  apply_icmp_filter_ufw
 }
 
 setup_defaults_iptables() {
@@ -312,17 +336,19 @@ apply_base_rules_iptables() {
   # EchoLink / service TCP
   add_rule INPUT -i "$SELECTED_IFACE" -p tcp --dport "$ECHO_TCP_PORT" -j ACCEPT
 
-  # Ping sur l'interface principale sélectionnée
-  insert_rule INPUT 3 -i "$SELECTED_IFACE" -p icmp --icmp-type echo-request -j ACCEPT
+  # ICMP echo-request : autorisé uniquement depuis WG_RANGE sur l'interface principale
+  insert_rule INPUT 3 -i "$SELECTED_IFACE" -p icmp --icmp-type echo-request -s "$WG_RANGE" -j ACCEPT
+  # Bloquer explicitement tout autre ICMP echo-request (toutes interfaces)
+  insert_rule INPUT 4 -p icmp --icmp-type echo-request -j DROP
 
   # Détection propre des interfaces ZeroTier
   while IFS= read -r zt_iface; do
     [[ -n "$zt_iface" ]] && zt_ifaces+=("$zt_iface")
   done < <(ip -o link show | awk -F': ' '/zt[a-zA-Z0-9]*/ {print $2}' | cut -d'@' -f1)
 
-  # Ping sur toutes les interfaces zt*
+  # ICMP sur interfaces zt* : autorisé uniquement depuis WG_RANGE
   for zt_iface in "${zt_ifaces[@]}"; do
-    insert_rule INPUT 4 -i "$zt_iface" -p icmp --icmp-type echo-request -j ACCEPT
+    insert_rule INPUT 5 -i "$zt_iface" -p icmp --icmp-type echo-request -s "$WG_RANGE" -j ACCEPT
   done
 
   iptables_enable_persistence_if_possible
@@ -568,6 +594,7 @@ show_summary() {
   echo "Réseaux locaux autorisés SSH : ${LOCAL_NETS[*]} (globaux, sans interface)"
   echo "EchoLink UDP : ${ECHO_UDP_PORTS[*]} sur $SELECTED_IFACE"
   echo "EchoLink TCP : $ECHO_TCP_PORT sur $SELECTED_IFACE"
+  echo "ICMP echo-request : autorisé uniquement depuis $WG_RANGE"
   echo "Mode : $1"
 }
 
@@ -597,6 +624,8 @@ initial_or_rebuild_config() {
     echo "  ufw allow in on $SELECTED_IFACE proto udp from any to any port ${ECHO_UDP_PORTS[0]}"
     echo "  ufw allow in on $SELECTED_IFACE proto udp from any to any port ${ECHO_UDP_PORTS[1]}"
     echo "  ufw allow in on $SELECTED_IFACE proto tcp from any to any port $ECHO_TCP_PORT"
+    echo "  [before.rules] ICMP echo-request ACCEPT depuis $WG_RANGE"
+    echo "  [before.rules] ICMP echo-request DROP (tout autre source)"
   else
     echo "  iptables -P INPUT DROP"
     echo "  iptables -P OUTPUT ACCEPT"
@@ -607,6 +636,8 @@ initial_or_rebuild_config() {
     echo "  iptables -A INPUT -i $SELECTED_IFACE -p udp --dport ${ECHO_UDP_PORTS[0]} -j ACCEPT"
     echo "  iptables -A INPUT -i $SELECTED_IFACE -p udp --dport ${ECHO_UDP_PORTS[1]} -j ACCEPT"
     echo "  iptables -A INPUT -i $SELECTED_IFACE -p tcp --dport $ECHO_TCP_PORT -j ACCEPT"
+    echo "  iptables -I INPUT 3 -i $SELECTED_IFACE -p icmp --icmp-type echo-request -s $WG_RANGE -j ACCEPT"
+    echo "  iptables -I INPUT 4 -p icmp --icmp-type echo-request -j DROP"
   fi
   [[ "$mode" == "1" ]] && echo "  rollback automatique au reboot si non confirmé"
 
