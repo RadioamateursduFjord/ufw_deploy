@@ -13,6 +13,37 @@ DEFAULT_LOCAL_NET="192.168.0.0/24"
 FIREWALL_BACKEND=""
 LOCAL_NETS=()
 
+# ---------------------------------------------------------------------------
+# Gestion de la journalisation UFW
+#
+# UFW_LOGGING_FINAL définit le niveau de journalisation appliqué UNE FOIS les
+# règles entièrement chargées.  Les valeurs reconnues par UFW sont :
+#   off | on | low | medium | high | full
+#
+# Mettre "off" laisse les logs désactivés en permanence (recommandé pour
+# éviter le flood kernel/dmesg lors des déploiements et en production).
+# Mettre "low" ou "medium" réactive les logs après l'application des règles.
+# ---------------------------------------------------------------------------
+UFW_LOGGING_FINAL="off"   # ← modifier ici si vous voulez des logs en prod
+
+# Désactive la journalisation UFW AVANT l'application des règles.
+# Cela évite le flood de logs pendant le reset/rechargement du pare-feu.
+ufw_logging_disable() {
+  if [[ "$FIREWALL_BACKEND" == "ufw" ]]; then
+    echo "# Désactivation de la journalisation UFW pendant l'application des règles..."
+    ufw logging off
+  fi
+}
+
+# Applique le niveau de journalisation final défini par UFW_LOGGING_FINAL.
+# Appelé APRÈS que toutes les règles UFW ont été chargées et que UFW est actif.
+ufw_logging_restore() {
+  if [[ "$FIREWALL_BACKEND" == "ufw" ]]; then
+    echo "# Application du niveau de journalisation UFW final : $UFW_LOGGING_FINAL"
+    ufw logging "$UFW_LOGGING_FINAL"
+  fi
+}
+
 need_root() {
   if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
     echo "Ce script doit être exécuté en root." >&2
@@ -232,36 +263,20 @@ iptables_enable_persistence_if_possible() {
 }
 
 setup_defaults_ufw() {
+  # ---------------------------------------------------------------------------
+  # Désactivation préventive de la journalisation UFW avant le reset.
+  # Un « ufw --force reset » suivi d'un rechargement des règles génère un grand
+  # nombre d'entrées dans le kernel log (dmesg / /var/log/ufw.log).
+  # On coupe les logs dès maintenant pour garder le journal propre.
+  # ---------------------------------------------------------------------------
+  ufw_logging_disable
+
   echo "+ ufw --force reset"
   ufw --force reset
   echo "+ ufw default deny incoming"
   ufw default deny incoming
   echo "+ ufw default allow outgoing"
   ufw default allow outgoing
-}
-
-# Injecte les règles ICMP filtrées dans /etc/ufw/before.rules (avant le COMMIT final)
-# Seul WG_RANGE est autorisé pour echo-request; tout le reste est bloqué.
-apply_icmp_filter_ufw() {
-  local before_rules="/etc/ufw/before.rules"
-  local marker="# node-ufw-manager: ICMP WG_RANGE filter"
-
-  if grep -q "$marker" "$before_rules" 2>/dev/null; then
-    echo "= Règles ICMP déjà présentes dans $before_rules, ignorées."
-    return
-  fi
-
-  echo "+ Injection des règles ICMP dans $before_rules"
-
-  # On insère avant la ligne COMMIT de la chaîne filter
-  sed -i "/^COMMIT$/i \\
-$marker\\
--A ufw-before-input -p icmp --icmp-type echo-request -s $WG_RANGE -j ACCEPT\\
--A ufw-before-input -p icmp --icmp-type echo-request -j DROP" "$before_rules"
-
-  # Supprimer les règles echo-request permissives déjà présentes dans before.rules
-  # (UFW en met une par défaut pour tout autoriser)
-  sed -i '/^-A ufw-before-input -p icmp --icmp-type echo-request -j ACCEPT$/d' "$before_rules"
 }
 
 apply_base_rules_ufw() {
@@ -275,9 +290,6 @@ apply_base_rules_ufw() {
   apply_rule_safe_ufw "ufw allow in on $SELECTED_IFACE proto udp from any to any port ${ECHO_UDP_PORTS[0]} comment 'EchoLink UDP 5198'" "${ECHO_UDP_PORTS[0]}/udp"
   apply_rule_safe_ufw "ufw allow in on $SELECTED_IFACE proto udp from any to any port ${ECHO_UDP_PORTS[1]} comment 'EchoLink UDP 5199'" "${ECHO_UDP_PORTS[1]}/udp"
   apply_rule_safe_ufw "ufw allow in on $SELECTED_IFACE proto tcp from any to any port $ECHO_TCP_PORT comment 'EchoLink TCP 5200'" "$ECHO_TCP_PORT/tcp"
-
-  # Filtre ICMP : seul WG_RANGE autorisé
-  apply_icmp_filter_ufw
 }
 
 setup_defaults_iptables() {
@@ -336,19 +348,17 @@ apply_base_rules_iptables() {
   # EchoLink / service TCP
   add_rule INPUT -i "$SELECTED_IFACE" -p tcp --dport "$ECHO_TCP_PORT" -j ACCEPT
 
-  # ICMP echo-request : autorisé uniquement depuis WG_RANGE sur l'interface principale
-  insert_rule INPUT 3 -i "$SELECTED_IFACE" -p icmp --icmp-type echo-request -s "$WG_RANGE" -j ACCEPT
-  # Bloquer explicitement tout autre ICMP echo-request (toutes interfaces)
-  insert_rule INPUT 4 -p icmp --icmp-type echo-request -j DROP
+  # Ping sur l'interface principale sélectionnée
+  insert_rule INPUT 3 -i "$SELECTED_IFACE" -p icmp --icmp-type echo-request -j ACCEPT
 
   # Détection propre des interfaces ZeroTier
   while IFS= read -r zt_iface; do
     [[ -n "$zt_iface" ]] && zt_ifaces+=("$zt_iface")
   done < <(ip -o link show | awk -F': ' '/zt[a-zA-Z0-9]*/ {print $2}' | cut -d'@' -f1)
 
-  # ICMP sur interfaces zt* : autorisé uniquement depuis WG_RANGE
+  # Ping sur toutes les interfaces zt*
   for zt_iface in "${zt_ifaces[@]}"; do
-    insert_rule INPUT 5 -i "$zt_iface" -p icmp --icmp-type echo-request -s "$WG_RANGE" -j ACCEPT
+    insert_rule INPUT 4 -i "$zt_iface" -p icmp --icmp-type echo-request -j ACCEPT
   done
 
   iptables_enable_persistence_if_possible
@@ -594,7 +604,10 @@ show_summary() {
   echo "Réseaux locaux autorisés SSH : ${LOCAL_NETS[*]} (globaux, sans interface)"
   echo "EchoLink UDP : ${ECHO_UDP_PORTS[*]} sur $SELECTED_IFACE"
   echo "EchoLink TCP : $ECHO_TCP_PORT sur $SELECTED_IFACE"
-  echo "ICMP echo-request : autorisé uniquement depuis $WG_RANGE"
+  # Rappel du comportement final des logs UFW
+  if [[ "$FIREWALL_BACKEND" == "ufw" ]]; then
+    echo "Journalisation UFW finale : $UFW_LOGGING_FINAL"
+  fi
   echo "Mode : $1"
 }
 
@@ -614,6 +627,7 @@ initial_or_rebuild_config() {
   echo
   echo "Commandes principales qui seront appliquées :"
   if [[ "$FIREWALL_BACKEND" == "ufw" ]]; then
+    echo "  ufw logging off          # désactivation logs pendant l'application"
     echo "  ufw --force reset"
     echo "  ufw default deny incoming"
     echo "  ufw default allow outgoing"
@@ -624,8 +638,8 @@ initial_or_rebuild_config() {
     echo "  ufw allow in on $SELECTED_IFACE proto udp from any to any port ${ECHO_UDP_PORTS[0]}"
     echo "  ufw allow in on $SELECTED_IFACE proto udp from any to any port ${ECHO_UDP_PORTS[1]}"
     echo "  ufw allow in on $SELECTED_IFACE proto tcp from any to any port $ECHO_TCP_PORT"
-    echo "  [before.rules] ICMP echo-request ACCEPT depuis $WG_RANGE"
-    echo "  [before.rules] ICMP echo-request DROP (tout autre source)"
+    echo "  ufw --force enable"
+    echo "  ufw logging $UFW_LOGGING_FINAL  # niveau de log final"
   else
     echo "  iptables -P INPUT DROP"
     echo "  iptables -P OUTPUT ACCEPT"
@@ -636,8 +650,6 @@ initial_or_rebuild_config() {
     echo "  iptables -A INPUT -i $SELECTED_IFACE -p udp --dport ${ECHO_UDP_PORTS[0]} -j ACCEPT"
     echo "  iptables -A INPUT -i $SELECTED_IFACE -p udp --dport ${ECHO_UDP_PORTS[1]} -j ACCEPT"
     echo "  iptables -A INPUT -i $SELECTED_IFACE -p tcp --dport $ECHO_TCP_PORT -j ACCEPT"
-    echo "  iptables -I INPUT 3 -i $SELECTED_IFACE -p icmp --icmp-type echo-request -s $WG_RANGE -j ACCEPT"
-    echo "  iptables -I INPUT 4 -p icmp --icmp-type echo-request -j DROP"
   fi
   [[ "$mode" == "1" ]] && echo "  rollback automatique au reboot si non confirmé"
 
@@ -645,9 +657,18 @@ initial_or_rebuild_config() {
   [[ "$confirm" =~ ^[Yy]$ ]] || { echo "Annulé."; return; }
 
   if [[ "$FIREWALL_BACKEND" == "ufw" ]]; then
+    # setup_defaults_ufw appelle ufw_logging_disable en interne (avant le reset)
     setup_defaults_ufw
     apply_base_rules_ufw
     ufw --force enable
+
+    # ---------------------------------------------------------------------------
+    # Restauration du niveau de journalisation UFW après activation complète.
+    # UFW est maintenant actif et toutes les règles sont en place ; il est sûr
+    # d'appliquer le niveau de log final défini par UFW_LOGGING_FINAL.
+    # ---------------------------------------------------------------------------
+    ufw_logging_restore
+
     if [[ "$mode" == "1" ]]; then
       install_test_rollback_ufw
       echo "Mode test UFW activé. Si tu perds l'accès, redémarre la machine."
